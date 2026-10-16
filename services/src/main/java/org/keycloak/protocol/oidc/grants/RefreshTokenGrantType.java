@@ -17,8 +17,10 @@
 
 package org.keycloak.protocol.oidc.grants;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
@@ -64,22 +66,31 @@ public class RefreshTokenGrantType extends OAuth2GrantTypeBase {
         String scopeParameter = getRequestedScopes();
         String resourceParameter = formParams.getFirst(OAuth2Constants.RESOURCE);
 
-        try {
-            session.clientPolicy().triggerOnEvent(new TokenRefreshContext(formParams, client, scopeParameter));
-            refreshToken = formParams.getFirst(OAuth2Constants.REFRESH_TOKEN);
-        } catch (ClientPolicyException cpe) {
-            event.detail(Details.REASON, Details.CLIENT_POLICY_ERROR);
-            event.detail(Details.CLIENT_POLICY_ERROR, cpe.getError());
-            event.detail(Details.CLIENT_POLICY_ERROR_DETAIL, cpe.getErrorDetail());
-            event.error(cpe.getError());
-            throw new CorsErrorResponseException(cors, cpe.getError(), cpe.getErrorDetail(), cpe.getErrorStatus());
-        }
-
         AccessTokenResponse res;
         try {
+            // Verify refresh token first so we can compute the effective scope from the session's
+            // originally granted scopes before client policies are evaluated.
             RefreshToken oldRefreshToken = tokenManager.verifyRefreshToken(session, realm, client, request, refreshToken, true);
 
-            RefreshTokenContext refreshTokenCtx = new RefreshTokenContext(oldRefreshToken, context, this, tokenManager, scopeParameter, resourceParameter);
+            // Compute the scope that client policies and token generation should use:
+            //   - If the client sent no scope parameter: use the full session scope (RFC 6749 §6).
+            //   - If the client sent a scope parameter: intersect it with the session scope to
+            //     prevent injection of scopes never originally granted (Bug #1) and to ensure
+            //     session-active scopes are preserved when omitted (Bug #2).
+            String effectiveScopeParameter = computeEffectiveScope(scopeParameter, oldRefreshToken.getScope());
+
+            try {
+                session.clientPolicy().triggerOnEvent(new TokenRefreshContext(formParams, client, effectiveScopeParameter));
+                refreshToken = formParams.getFirst(OAuth2Constants.REFRESH_TOKEN);
+            } catch (ClientPolicyException cpe) {
+                event.detail(Details.REASON, Details.CLIENT_POLICY_ERROR);
+                event.detail(Details.CLIENT_POLICY_ERROR, cpe.getError());
+                event.detail(Details.CLIENT_POLICY_ERROR_DETAIL, cpe.getErrorDetail());
+                event.error(cpe.getError());
+                throw new CorsErrorResponseException(cors, cpe.getError(), cpe.getErrorDetail(), cpe.getErrorStatus());
+            }
+
+            RefreshTokenContext refreshTokenCtx = new RefreshTokenContext(oldRefreshToken, context, this, tokenManager, effectiveScopeParameter, resourceParameter);
 
             RefreshTokenProvider refreshTokenProvider = session.getKeycloakSessionFactory()
                     .getProviderFactoriesStream(RefreshTokenProvider.class)
@@ -123,6 +134,23 @@ public class RefreshTokenGrantType extends OAuth2GrantTypeBase {
         event.success();
 
         return cors.add(Response.ok(res, MediaType.APPLICATION_JSON_TYPE));
+    }
+
+    /**
+     * Computes the effective scope for a token refresh request.
+     *
+     * When no scope is requested, returns the full session scope (RFC 6749 §6).
+     * When a scope is requested, returns only the scopes present in both the
+     * request and the original session grant, preventing scope injection.
+     */
+    private String computeEffectiveScope(String requestedScope, String sessionScope) {
+        if (requestedScope == null || requestedScope.isEmpty()) {
+            return sessionScope;
+        }
+        Set<String> sessionScopes = Arrays.stream(sessionScope.split(" ")).collect(Collectors.toSet());
+        return Arrays.stream(requestedScope.split(" "))
+                .filter(sessionScopes::contains)
+                .collect(Collectors.joining(" "));
     }
 
     @Override
